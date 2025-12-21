@@ -14,6 +14,20 @@ enum NotificationMessageType : uint64_t {
     GLOBAL_PERSISTENCE
 };
 
+// fmt::formatter specialization for NotificationMessageType (required by fmt v10+)
+template <>
+struct fmt::formatter<NotificationMessageType> : fmt::formatter<std::string_view> {
+    auto format(NotificationMessageType mt, fmt::format_context& ctx) const {
+        std::string_view name;
+        switch(mt) {
+            case LOCAL_PERSISTENCE: name = "LOCAL_PERSISTENCE"; break;
+            case GLOBAL_PERSISTENCE: name = "GLOBAL_PERSISTENCE"; break;
+            default: name = "UNKNOWN"; break;
+        }
+        return fmt::formatter<std::string_view>::format(name, ctx);
+    }
+};
+
 struct NotificationRequest {
     NotificationMessageType notification_type;
     derecho::node_id_t client_id;

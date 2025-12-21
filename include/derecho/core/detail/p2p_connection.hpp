@@ -26,7 +26,24 @@ enum MESSAGE_TYPE {
 };
 
 std::ostream& operator<<(std::ostream& os, MESSAGE_TYPE mt);
+}  // namespace sst
 
+// fmt::formatter specialization for sst::MESSAGE_TYPE (required by fmt v10+)
+template <>
+struct fmt::formatter<sst::MESSAGE_TYPE> : fmt::formatter<std::string_view> {
+    auto format(sst::MESSAGE_TYPE mt, fmt::format_context& ctx) const {
+        std::string_view name;
+        switch(mt) {
+            case sst::P2P_REPLY: name = "P2P_REPLY"; break;
+            case sst::P2P_REQUEST: name = "P2P_REQUEST"; break;
+            case sst::RPC_REPLY: name = "RPC_REPLY"; break;
+            default: name = "UNKNOWN"; break;
+        }
+        return fmt::formatter<std::string_view>::format(name, ctx);
+    }
+};
+
+namespace sst {
 static const MESSAGE_TYPE p2p_message_types[] = {P2P_REPLY,
                                                  P2P_REQUEST,
                                                  RPC_REPLY};

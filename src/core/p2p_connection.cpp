@@ -74,7 +74,7 @@ std::optional<std::pair<uint8_t*, MESSAGE_TYPE>> P2PConnection::probe() {
 }
 
 void P2PConnection::increment_incoming_seq_num(MESSAGE_TYPE type) {
-    dbg_trace(rpc_logger, "P2PConnection updating incoming_seq_num for type {} to {}", type, incoming_seq_nums_map[type] + 1);
+    dbg_trace(rpc_logger, "P2PConnection updating incoming_seq_num for type {} to {}", type, incoming_seq_nums_map[type].load() + 1);
     incoming_seq_nums_map[type]++;
 }
 
@@ -93,7 +93,7 @@ std::optional<P2PBufferHandle> P2PConnection::get_sendbuffer_ptr(MESSAGE_TYPE ty
                                        + getOffsetBuf(type, cur_seq_num),
                                cur_seq_num};
     }
-    dbg_trace(rpc_logger, "P2PConnection: Send buffer was full: incoming_seq_nums[REPLY] = {}, but outgoing_seq_nums[REQUEST] = {}", incoming_seq_nums_map[MESSAGE_TYPE::P2P_REPLY], outgoing_seq_nums_map[MESSAGE_TYPE::P2P_REQUEST]);
+    dbg_trace(rpc_logger, "P2PConnection: Send buffer was full: incoming_seq_nums[REPLY] = {}, but outgoing_seq_nums[REQUEST] = {}", incoming_seq_nums_map[MESSAGE_TYPE::P2P_REPLY].load(), outgoing_seq_nums_map[MESSAGE_TYPE::P2P_REQUEST].load());
     return std::nullopt;
 }
 
