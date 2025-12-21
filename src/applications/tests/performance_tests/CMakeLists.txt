@@ -53,3 +53,7 @@ target_link_libraries(signed_store_test derecho)
 
 add_executable(oob_perf oob_perf.cpp bytes_object.cpp)
 target_link_libraries(oob_perf derecho)
+
+# syntony test
+add_executable(syntony_test syntony_test.cpp aggregate_bandwidth.cpp partial_senders_allocator.cpp)
+target_link_libraries(syntony_test derecho)
