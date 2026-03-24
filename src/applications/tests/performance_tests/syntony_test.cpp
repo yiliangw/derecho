@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -41,6 +42,9 @@ static constexpr const char* SYNTONY_TEST_NUM_MESSAGES = "SYNTONY_TEST/num_messa
 static constexpr const char* SYNTONY_TEST_DELIVERY_MODE = "SYNTONY_TEST/delivery_mode";
 static constexpr const char* SYNTONY_TEST_MSG_SIZE = "SYNTONY_TEST/msg_size";
 static constexpr const char* SYNTONY_TEST_PROC_NAME = "SYNTONY_TEST/proc_name";
+static constexpr const char* SYNTONY_TEST_LATENCY_BUF_SZ = "SYNTONY_TEST/latency_buf_sz";
+static constexpr const char* SYNTONY_TEST_PROFILING_START = "SYNTONY_TEST/profiling_start";
+static constexpr const char* SYNTONY_TEST_MAX_OUTSTANDING_REQS = "SYNTONY_TEST/max_outstanding_reqs";
 
 #define DEFAULT_PROC_NAME "bw_test"
 
@@ -96,6 +100,14 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    uint32_t latency_buf_sz = hasCustomizedConfKey(SYNTONY_TEST_LATENCY_BUF_SZ)
+        ? getConfUInt32(SYNTONY_TEST_LATENCY_BUF_SZ) : 0;
+    uint32_t profiling_start = hasCustomizedConfKey(SYNTONY_TEST_PROFILING_START)
+        ? getConfUInt32(SYNTONY_TEST_PROFILING_START) : 0;
+    // 0 means no application-level limit (only Derecho's window_size applies)
+    uint32_t max_outstanding_reqs = hasCustomizedConfKey(SYNTONY_TEST_MAX_OUTSTANDING_REQS)
+        ? getConfUInt32(SYNTONY_TEST_MAX_OUTSTANDING_REQS) : 0;
+
     // Convert sender_selector to enum
     const PartialSendMode senders_mode = num_senders_selector == 0
                                                  ? PartialSendMode::ALL_SENDERS
@@ -119,18 +131,84 @@ int main(int argc, char* argv[]) {
             break;
     }
 
+    // Same pattern as DPDK LocalServer::RequestHeader
+    struct RequestHeader {
+        uint32_t src;
+        uint64_t timestamp_ns;
+    };
+
     // variable 'done' tracks the end of the test
     std::atomic<bool> done = false;
+
+    // Per-message latency tracking (for locally sent messages only)
+    std::vector<uint64_t> latencies(latency_buf_sz);
+    std::atomic<uint32_t> latency_cnt{0};
+    // Node ID (not rank) for matching sender_id in callbacks
+    uint32_t my_id;
+
+    // Application-level outstanding request tracking
+    std::atomic<uint32_t> outstanding{0};
+
+    // Bandwidth profiling: record time at profiling_start-th and last delivery
+    std::atomic<bool> profiling_started{profiling_start == 0};
+    std::chrono::steady_clock::time_point profiling_start_time;
+
     // callback into the application code at each message delivery
-    auto stability_callback = [&done,
-                               total_num_messages,
+    // Compute total warmup deliveries based on send mode
+    uint64_t total_profiling_start = 0;
+    switch(senders_mode) {
+        case PartialSendMode::ALL_SENDERS:
+            total_profiling_start = static_cast<uint64_t>(profiling_start) * num_nodes;
+            break;
+        case PartialSendMode::HALF_SENDERS:
+            total_profiling_start = static_cast<uint64_t>(profiling_start) * (num_nodes / 2);
+            break;
+        case PartialSendMode::ONE_SENDER:
+            total_profiling_start = profiling_start;
+            break;
+    }
+
+    auto stability_callback = [&done, &latencies, &latency_cnt, &my_id,
+                               &profiling_started, &profiling_start_time,
+                               &outstanding,
+                               total_num_messages, latency_buf_sz, profiling_start,
+                               total_profiling_start,
                                num_delivered = 0u](uint32_t subgroup,
                                                    uint32_t sender_id,
                                                    long long int index,
                                                    std::optional<std::pair<uint8_t*, long long int>> data,
                                                    persistent::version_t ver) mutable {
+        // Record latency for locally sent messages by reading RequestHeader from payload.
+        // Skip the first profiling_start messages as warmup.
+        if(latency_buf_sz > 0 && data.has_value() &&
+           data->second >= static_cast<long long int>(sizeof(RequestHeader)) &&
+           index >= static_cast<long long int>(profiling_start)) {
+            RequestHeader hdr;
+            std::memcpy(&hdr, data->first, sizeof(hdr));
+            if(hdr.src == my_id) {
+                uint32_t idx = latency_cnt.load(std::memory_order_relaxed);
+                if(idx < latency_buf_sz) {
+                    auto now = std::chrono::steady_clock::now();
+                    uint64_t now_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            now.time_since_epoch()).count());
+                    latencies[idx] = now_ns - hdr.timestamp_ns;
+                    latency_cnt.store(idx + 1, std::memory_order_relaxed);
+                }
+            }
+        }
+        // Decrement outstanding counter for locally sent messages
+        if(sender_id == my_id) {
+            outstanding.fetch_sub(1, std::memory_order_relaxed);
+        }
         // Count the total number of messages delivered
         ++num_delivered;
+        // Record bandwidth profiling start time after warmup
+        if(!profiling_started.load(std::memory_order_relaxed) &&
+           num_delivered >= total_profiling_start) {
+            profiling_start_time = std::chrono::steady_clock::now();
+            profiling_started.store(true, std::memory_order_relaxed);
+        }
         // Check for completion
         if(num_delivered == total_num_messages) {
             done = true;
@@ -155,6 +233,7 @@ int main(int argc, char* argv[]) {
     cout << "Finished constructing/joining Group" << endl;
     auto members_order = group.get_members();
     uint32_t node_rank = group.get_my_rank();
+    my_id = members_order[node_rank];
 
     long long unsigned int max_payload_size = getConfUInt64(derecho::Conf::SUBGROUP_DEFAULT_MAX_PAYLOAD_SIZE);
     // Use msg_size from config if specified, otherwise use max_payload_size
@@ -171,9 +250,24 @@ int main(int argc, char* argv[]) {
     auto send_all = [&]() {
         Replicated<RawObject>& raw_subgroup = group.get_subgroup<RawObject>();
         for(uint i = 0; i < num_messages; ++i) {
-            // the lambda function writes the message contents into the provided memory buffer
-            // in this case, we do not touch the memory region
-            raw_subgroup.send(msg_size, [](uint8_t* buf) {});
+            // Application-level flow control
+            if(max_outstanding_reqs > 0) {
+                while(outstanding.load(std::memory_order_relaxed) >= max_outstanding_reqs) {
+                    // Spin until a delivery callback frees a slot
+                }
+            }
+            outstanding.fetch_add(1, std::memory_order_relaxed);
+            raw_subgroup.send(msg_size, [&](uint8_t* buf) {
+                if(msg_size >= sizeof(RequestHeader)) {
+                    RequestHeader hdr;
+                    hdr.src = my_id;
+                    auto now = std::chrono::steady_clock::now();
+                    hdr.timestamp_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            now.time_since_epoch()).count());
+                    std::memcpy(buf, &hdr, sizeof(hdr));
+                }
+            });
         }
     };
 
@@ -196,25 +290,56 @@ int main(int argc, char* argv[]) {
     }
     // end timer
     auto end_time = std::chrono::steady_clock::now();
-    long long int nanoseconds_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
-    // calculate bandwidth measured locally
-    double bw;
+    // Use profiling_start_time for bandwidth if warmup was configured
+    auto effective_start = profiling_started.load(std::memory_order_relaxed)
+        ? profiling_start_time : start_time;
+    long long int nanoseconds_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - effective_start).count();
+    uint32_t profiled_per_sender = num_messages - profiling_start;
+    // Total profiled messages replicated across all senders
+    uint64_t total_profiled;
     if(senders_mode == PartialSendMode::ALL_SENDERS) {
-        bw = (msg_size * num_messages * num_nodes + 0.0) / nanoseconds_elapsed;
+        total_profiled = static_cast<uint64_t>(profiled_per_sender) * num_nodes;
     } else if(senders_mode == PartialSendMode::HALF_SENDERS) {
-        bw = (msg_size * num_messages * (num_nodes / 2) + 0.0) / nanoseconds_elapsed;
+        total_profiled = static_cast<uint64_t>(profiled_per_sender) * (num_nodes / 2);
     } else {
-        bw = (msg_size * num_messages + 0.0) / nanoseconds_elapsed;
+        total_profiled = profiled_per_sender;
     }
+
+    // Dump per-message latencies for locally sent messages
+    uint32_t final_lat_cnt = latency_cnt.load(std::memory_order_relaxed);
+    if(final_lat_cnt > 0) {
+        cout << "Latency samples (" << final_lat_cnt << " entries):";
+        __uint128_t lat_sum = 0;
+        for(uint32_t i = 0; i < final_lat_cnt; i++) {
+            cout << " " << latencies[i];
+            lat_sum += latencies[i];
+        }
+        cout << endl;
+        uint64_t lat_avg = static_cast<uint64_t>(lat_sum / final_lat_cnt);
+        cout << "Average latency: " << lat_avg << " ns" << endl;
+    } else {
+        cout << "No latency samples recorded (non-sender)" << endl;
+    }
+
+    // calculate throughput
+    double bw = (msg_size * total_profiled + 0.0) / nanoseconds_elapsed;
+    double throughput = (total_profiled * 1e9) / nanoseconds_elapsed;
     // aggregate bandwidth from all nodes
     double avg_bw = aggregate_bandwidth(members_order, members_order[node_rank], bw);
-    // log the result at the leader node
-    if(node_rank == 0) {
-        unsigned int window_size = getConfUInt32(derecho::Conf::SUBGROUP_DEFAULT_WINDOW_SIZE);
-        rls_default_info("=== Performance Results ===");
-        rls_default_info("num_nodes={} sender_selector={} msg_size={} window_size={} num_messages={} delivery_mode={} bandwidth={:.6f}GB/s time={}ns",
-                         num_nodes, num_senders_selector, msg_size, window_size, num_messages, delivery_mode, avg_bw, nanoseconds_elapsed);
-    }
+    // log the result
+    unsigned int window_size = getConfUInt32(derecho::Conf::SUBGROUP_DEFAULT_WINDOW_SIZE);
+    cout << "=== Performance Results ===" << endl;
+    cout << "num_nodes=" << num_nodes
+         << " sender_selector=" << num_senders_selector
+         << " msg_size=" << msg_size
+         << " window_size=" << window_size
+         << " max_outstanding_reqs=" << max_outstanding_reqs
+         << " num_messages=" << num_messages
+         << " delivery_mode=" << delivery_mode
+         << " bandwidth=" << avg_bw << "GB/s"
+         << " throughput=" << throughput << "msg/s"
+         << " total_profiled=" << total_profiled
+         << " time=" << nanoseconds_elapsed << "ns" << endl;
 
     group.barrier_sync();
     group.leave();
